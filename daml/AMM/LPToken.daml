@@ -1,0 +1,82 @@
+-- | This module defines the LPToken, a fungible token representing a
+-- | liquidity provider's proportional share in an AMM liquidity pool.
+module AMM.LPToken where
+
+-- | Represents a Liquidity Provider's share in a specific AMM pool.
+-- This token is fungible and transferable. Its lifecycle (creation and archival)
+-- is primarily managed by choices on the associated `Pool` contract, specifically
+-- during the addition and removal of liquidity.
+template LPToken
+  with
+    poolOperator: Party
+      -- ^ The operator of the AMM pool, who issues and guarantees the token.
+      -- This party is the signatory on the token's creation.
+    owner: Party
+      -- ^ The liquidity provider who owns this token contract.
+    poolId: Text
+      -- ^ A stable, unique identifier for the AMM pool. This links the token
+      -- to a specific pool without depending on a transient contract ID.
+    tokenA: Text
+      -- ^ The identifier for the first asset in the pool (for display/reference).
+    tokenB: Text
+      -- ^ The identifier for the second asset in the pool (for display/reference).
+    quantity: Decimal
+      -- ^ The number of LP tokens held in this contract.
+
+  where
+    signatory poolOperator
+    observer owner
+
+    -- A unique key ensuring each owner has at most one LPToken contract per pool.
+    -- This simplifies aggregation of an owner's holdings and makes the token
+    -- behave like a standard fungible asset account.
+    key (poolId, owner) : (Text, Party)
+    maintainer poolOperator
+
+    -- A token contract must represent a positive quantity.
+    ensure quantity > 0.0
+
+    choice Transfer
+      : ContractId LPToken
+      -- ^ Transfers the full quantity of LP tokens to a new owner.
+      -- For partial transfers, the caller should first use the `Split` choice.
+      -- This is a consuming choice, meaning the original contract is archived.
+      with
+        newOwner: Party
+          -- ^ The party to receive the tokens.
+      controller owner
+      do
+        -- It is nonsensical for an owner to transfer tokens to themselves.
+        assert (owner /= newOwner)
+
+        -- Create a new token for the new owner with the same properties.
+        -- The old token is consumed automatically upon successful completion of the choice.
+        create this with owner = newOwner
+
+    choice Split
+      : (ContractId LPToken, ContractId LPToken)
+      -- ^ Splits a single token contract into two smaller ones.
+      -- This is the standard Daml pattern to facilitate partial transfers.
+      -- An owner would split a token and then transfer one of the resulting contracts.
+      -- This is a consuming choice.
+      with
+        splitAmount : Decimal
+          -- ^ The amount for the first of the two new contracts.
+          -- The second contract will be created with `quantity - splitAmount`.
+      controller owner
+      do
+        let remainingAmount = quantity - splitAmount
+
+        -- Validate that the split results in two new tokens with positive quantities.
+        ensure splitAmount > 0.0
+        ensure remainingAmount > 0.0
+
+        -- Create the new token contract for the specified split amount.
+        splitCid <- create this with quantity = splitAmount
+
+        -- Create the new token contract for the remaining amount.
+        remainingCid <- create this with quantity = remainingAmount
+
+        -- The original contract is consumed automatically.
+        -- Return the contract IDs of the two new token contracts.
+        pure (splitCid, remainingCid)
