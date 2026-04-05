@@ -1,0 +1,232 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module AMM.Pool where
+
+import DA.Assert ((assert, assertMsg))
+import DA.Math (sqrt)
+import DA.Next.Set (Set)
+import qualified DA.Next.Set as Set
+import AMM.Token (Iou, LPToken)
+import AMM.Role (OperatorRole)
+
+-- | A constant to lock a small initial amount of liquidity, protecting the first
+-- | liquidity provider from front-running attacks that could manipulate the initial price.
+-- | This follows the Uniswap v2 pattern.
+minLiquidity : Decimal = 1.0e-6
+
+-- | Represents a single liquidity pool for a pair of tokens.
+-- | It holds reserves of two tokens and allows for trading between them based on the
+-- | constant product formula (x * y = k). Fees from trades accrue to the reserves,
+-- | increasing the value of LP tokens held by liquidity providers.
+template Pool
+  with
+    operator : Party
+      -- ^ The party that manages the pool's operational parameters.
+    tokenA : Text
+      -- ^ The symbol for the first token in the pair.
+    tokenB : Text
+      -- ^ The symbol for the second token in the pair.
+    reserveA : Decimal
+      -- ^ The total amount of token A held by the pool.
+    reserveB : Decimal
+      -- ^ The total amount of token B held by the pool.
+    totalSupply : Decimal
+      -- ^ The total supply of LP (Liquidity Provider) tokens for this pool.
+    liquidityProviders : Set Party
+      -- ^ The set of parties who have provided liquidity to the pool.
+    feeBps : Int
+      -- ^ The trading fee in basis points (e.g., 30 for 0.30%).
+  where
+    signatory operator
+    observer Set.toList liquidityProviders
+
+    ensure
+      tokenA < tokenB &&
+      reserveA >= 0.0 &&
+      reserveB >= 0.0 &&
+      totalSupply >= 0.0 &&
+      feeBps >= 0 && feeBps < 10000
+
+    key (operator, tokenA, tokenB) : (Party, Text, Text)
+    maintainer key._1
+
+    -- | Allows a liquidity provider to deposit a pair of tokens into the pool.
+    -- | In return, they receive LP tokens representing their share of the pool.
+    -- | The deposit must be at the current ratio of reserves.
+    choice AddLiquidity : ContractId LPToken
+      with
+        lp : Party
+          -- ^ The liquidity provider adding funds.
+        iouACid : ContractId Iou
+          -- ^ The contract for the amount of token A being deposited.
+        iouBCid : ContractId Iou
+          -- ^ The contract for the amount of token B being deposited.
+      controller lp
+      do
+        iouA <- fetch iouACid
+        iouB <- fetch iouBCid
+
+        -- Validate the deposited tokens match the pool's tokens and owner.
+        assertMsg "Token A symbol mismatch" (iouA.symbol == tokenA)
+        assertMsg "Token B symbol mismatch" (iouB.symbol == tokenB)
+        assertMsg "Depositor must be the owner of the Ious" (iouA.owner == lp && iouB.owner == lp)
+
+        let amountA = iouA.amount
+        let amountB = iouB.amount
+        assertMsg "Deposit amounts must be positive" (amountA > 0.0 && amountB > 0.0)
+
+        -- Archive the deposited token Ious.
+        archive iouACid
+        archive iouBCid
+
+        -- Calculate the amount of LP tokens to mint.
+        let (liquidityMinted, newTotalSupply) =
+              if totalSupply == 0.0 then
+                -- This is the first liquidity addition. The amount of LP tokens is the
+                -- geometric mean of the two token amounts, minus a minimum liquidity amount
+                -- that is "burned" to protect against front-running.
+                let initialLiquidity = sqrt (amountA * amountB)
+                assertMsg "Initial liquidity is too low" (initialLiquidity > minLiquidity)
+                (initialLiquidity - minLiquidity, initialLiquidity)
+              else
+                -- For subsequent additions, the liquidity minted is proportional to the
+                -- existing total supply. The deposit ratio must match the reserve ratio.
+                let liquidityA = amountA * totalSupply / reserveA
+                let liquidityB = amountB * totalSupply / reserveB
+                assertMsg "Deposit ratio does not match pool reserve ratio" (abs (liquidityA - liquidityB) < 1.0e-9)
+                (liquidityA, totalSupply + liquidityA)
+
+        -- Update the pool state with the new reserves and LP token supply.
+        create this with
+          reserveA = reserveA + amountA
+          reserveB = reserveB + amountB
+          totalSupply = newTotalSupply
+          liquidityProviders = Set.insert lp liquidityProviders
+
+        -- Create the LP tokens for the provider.
+        create LPToken with
+          poolOperator = operator
+          owner = lp
+          ..
+
+    -- | Allows a liquidity provider to burn their LP tokens to withdraw their proportional
+    -- | share of the underlying tokens from the pool.
+    choice RemoveLiquidity : (ContractId Iou, ContractId Iou)
+      with
+        lp : Party
+          -- ^ The liquidity provider removing funds.
+        lpTokenCid : ContractId LPToken
+          -- ^ The LP tokens to be burned.
+      controller lp
+      do
+        lpToken <- fetch lpTokenCid
+        assertMsg "LP token does not belong to this pool"
+          (lpToken.poolOperator == operator && lpToken.tokenA == tokenA && lpToken.tokenB == tokenB)
+        assertMsg "Caller is not the owner of the LP tokens" (lpToken.owner == lp)
+
+        let liquidityToBurn = lpToken.amount
+        assertMsg "Cannot burn zero LP tokens" (liquidityToBurn > 0.0)
+        assertMsg "Cannot burn more LP tokens than exist" (liquidityToBurn <= totalSupply)
+
+        -- Archive the LP tokens being burned.
+        archive lpTokenCid
+
+        -- Calculate the proportional amount of each token to withdraw.
+        let amountA = liquidityToBurn * reserveA / totalSupply
+        let amountB = liquidityToBurn * reserveB / totalSupply
+        assertMsg "Withdrawal amounts must be positive" (amountA > 0.0 && amountB > 0.0)
+
+        -- Update the pool state. Note: For simplicity, the LP is not removed from the
+        -- `liquidityProviders` set. A production system might track total position
+        -- and remove them if their balance becomes zero.
+        create this with
+          reserveA = reserveA - amountA
+          reserveB = reserveB - amountB
+          totalSupply = totalSupply - liquidityToBurn
+
+        -- Create the withdrawn token Ious for the provider.
+        -- We assume the pool operator is the issuer of the underlying tokens for this example.
+        iouACid <- create Iou with issuer = operator, owner = lp, symbol = tokenA, amount = amountA
+        iouBCid <- create Iou with issuer = operator, owner = lp, symbol = tokenB, amount = amountB
+
+        return (iouACid, iouBCid)
+
+    -- | Swaps an exact amount of an input token for a calculated amount of an output token.
+    -- | The calculation includes a fee that accrues to the liquidity providers.
+    choice Swap : ContractId Iou
+      with
+        trader : Party
+          -- ^ The party performing the swap.
+        iouInCid : ContractId Iou
+          -- ^ The Iou contract for the token being sold to the pool.
+      controller trader
+      do
+        iouIn <- fetch iouInCid
+        assertMsg "Trader must be the owner of the input Iou" (iouIn.owner == trader)
+
+        let amountIn = iouIn.amount
+        assertMsg "Input amount must be positive" (amountIn > 0.0)
+
+        archive iouInCid
+
+        -- Determine the input/output reserves and calculate the output amount.
+        let (reserveIn, reserveOut, outputSymbol) =
+              if iouIn.symbol == tokenA then (reserveA, reserveB, tokenB)
+              else if iouIn.symbol == tokenB then (reserveB, reserveA, tokenA)
+              else abort ("Token " <> iouIn.symbol <> " is not part of this pool.")
+
+        let feeFactor : Decimal = intToDecimal (10000 - feeBps)
+        let amountInWithFee = amountIn * feeFactor
+        let numerator = amountInWithFee * reserveOut
+        let denominator = (reserveIn * 10000.0) + amountInWithFee
+        let amountOut = numerator / denominator
+
+        -- Update reserves and recreate the pool.
+        let (newReserveA, newReserveB) =
+              if iouIn.symbol == tokenA
+                then (reserveA + amountIn, reserveB - amountOut)
+                else (reserveA - amountOut, reserveB + amountIn)
+
+        -- Invariant check: The product of reserves must not decrease after a swap.
+        -- This ensures the pool's value doesn't drain, protecting LPs.
+        assert (newReserveA * newReserveB >= reserveA * reserveB)
+
+        create this with
+          reserveA = newReserveA
+          reserveB = newReserveB
+
+        -- Create the output token Iou for the trader.
+        create Iou with issuer = operator, owner = trader, symbol = outputSymbol, amount = amountOut
+
+
+-- | A factory template to create new liquidity pools.
+-- | This centralizes the creation logic and ensures canonical ordering of token pairs.
+template PoolFactory
+  with
+    operator : Party
+    roleCid : ContractId OperatorRole
+  where
+    signatory operator
+
+    choice CreatePool : ContractId Pool
+      with
+        tokenA_ : Text
+        tokenB_ : Text
+        feeBps : Int
+      controller operator
+      do
+        -- Enforce canonical ordering for the token pair to prevent duplicate pools.
+        let (tokenA, tokenB) = if tokenA_ < tokenB_ then (tokenA_, tokenB_) else (tokenB_, tokenA_)
+
+        create Pool with
+          operator
+          tokenA
+          tokenB
+          feeBps
+          reserveA = 0.0
+          reserveB = 0.0
+          totalSupply = 0.0
+          liquidityProviders = Set.empty
