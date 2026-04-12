@@ -1,0 +1,117 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module AMM.Swap where
+
+import DA.Assert
+
+import AMM.Pool (Pool(..))
+import AMM.Token (FungibleToken)
+
+-- | Pure function for calculating swap output amount based on the constant product formula (x*y=k).
+-- This function encapsulates the core pricing logic of the AMM.
+getAmountOut:
+  Decimal -> -- ^ amountIn: The amount of tokens being sent to the pool.
+  Decimal -> -- ^ reserveIn: The reserve of the input token in the pool.
+  Decimal -> -- ^ reserveOut: The reserve of the output token in the pool.
+  Decimal    -- ^ Returns the amount of output tokens the swapper will receive.
+getAmountOut amountIn reserveIn reserveOut =
+  -- Ensure reserves are positive to prevent division by zero and other pathological cases.
+  assertMsg "INSUFFICIENT_LIQUIDITY: Input reserve must be positive." (reserveIn > 0.0)
+  assertMsg "INSUFFICIENT_LIQUIDITY: Output reserve must be positive." (reserveOut > 0.0)
+
+  -- Uniswap v2 charges a 0.3% fee (30 basis points).
+  -- This fee is taken from the input amount and remains in the pool, effectively
+  -- rewarding liquidity providers by increasing the value of their shares.
+  let
+    feeNumerator = 997.0
+    feeDenominator = 1000.0
+
+    amountInWithFee = amountIn * feeNumerator
+    numerator = amountInWithFee * reserveOut
+    denominator = (reserveIn * feeDenominator) + amountInWithFee
+
+  in
+    -- The output amount is calculated to keep the product of reserves constant after
+    -- accounting for the fee-adjusted input. The formula is:
+    -- amountOut = (reserveOut * amountIn * 997) / (reserveIn * 1000 + amountIn * 997)
+    numerator / denominator
+
+-- This template instance adds the `SwapExactTokensForTokens` choice to the `Pool`
+-- template defined in `AMM.Pool`. This allows for modular separation of concerns,
+-- keeping swap logic separate from core pool management and other functionalities
+-- like adding/removing liquidity.
+template instance Pool with
+  -- This is a consuming choice that atomically swaps a user-provided amount of one token
+  -- for a calculated amount of the other token in the pool. It archives the existing
+  -- pool contract and creates a new one with updated reserves.
+  choice SwapExactTokensForTokens : (ContractId Pool, ContractId FungibleToken)
+    -- ^ Returns a tuple containing the ContractId of the updated Pool contract and the
+    --   newly created fungible token contract for the recipient.
+    with
+      swapper : Party
+      -- ^ The party initiating the swap. They must be the owner of `tokenInCid`.
+      tokenInCid : ContractId FungibleToken
+      -- ^ The contract for the input tokens being provided by the swapper. This contract
+      --   will be archived as part of the transaction.
+      amountOutMin : Decimal
+      -- ^ The minimum amount of output tokens the swapper is willing to accept. This
+      --   provides protection against price slippage during transaction execution.
+      recipient : Party
+      -- ^ The party who will receive the swapped tokens.
+    controller swapper
+    do
+      -- 1. Fetch the input token contract to verify its details. The `swapper` being a
+      --    controller on this choice provides the authority to fetch their own token contract.
+      tokenIn <- fetch tokenInCid
+      assertEqual tokenIn.owner swapper "SWAPPER_MUST_OWN_INPUT_TOKENS"
+
+      let
+        amountIn = tokenIn.quantity
+        tokenInInstrument = tokenIn.instrument
+
+      -- 2. Determine the swap direction and get the corresponding reserves from the pool state.
+      (reserveIn, reserveOut, tokenOutInstrument) <-
+        if tokenInInstrument == this.instrumentA then
+          return (this.reserveA, this.reserveB, this.instrumentB)
+        else if tokenInInstrument == this.instrumentB then
+          return (this.reserveB, this.reserveA, this.instrumentA)
+        else
+          abort ("INVALID_TOKEN: Input token " <> show tokenInInstrument <> " is not one of the two tokens in this pool.")
+
+      -- 3. Calculate the amount of output tokens using the pure `getAmountOut` function.
+      let amountOut = getAmountOut amountIn reserveIn reserveOut
+
+      -- 4. Enforce the user-defined slippage protection. The transaction will fail if the
+      --    calculated output is less than the specified minimum.
+      assertMsg ("INSUFFICIENT_OUTPUT_AMOUNT: Slippage tolerance not met. " <>
+                 "Required at least " <> show amountOutMin <> ", but calculated " <> show amountOut <> ".")
+                 (amountOut >= amountOutMin)
+
+      -- 5. Atomically execute the state changes.
+      -- 5a. Consume the swapper's input tokens by archiving their contract.
+      archive tokenInCid
+
+      -- 5b. Calculate the new reserves for the pool.
+      let
+        (newReserveA, newReserveB) =
+          if tokenInInstrument == this.instrumentA
+          then (this.reserveA + amountIn, this.reserveB - amountOut)
+          else (this.reserveA - amountOut, this.reserveB + amountIn)
+
+      -- 5c. Create the new, updated pool contract, archiving the old one implicitly.
+      --     The new pool inherits all properties of the old one, with updated reserves.
+      newPoolCid <- create this with
+        reserveA = newReserveA
+        reserveB = newReserveB
+
+      -- 5d. Create the output tokens and assign them to the recipient. The authority to create
+      --     these tokens comes from the `manager` of the pool, who is a signatory on this
+      --     template and is assumed to be the issuer of the tokens.
+      outputTokenCid <- create FungibleToken with
+        instrument = tokenOutInstrument
+        quantity = amountOut
+        owner = recipient
+
+      -- 6. Return the contract IDs of the new pool and the new output tokens.
+      return (newPoolCid, outputTokenCid)
