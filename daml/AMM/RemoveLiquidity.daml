@@ -1,0 +1,99 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module AMM.RemoveLiquidity where
+
+import DA.Action
+import DA.Assert
+import DA.Foldable (sum)
+import DA.List (mapA, forA_)
+import DA.Set as Set
+import DA.Time (time)
+
+import AMM.Pool (T(..), updatePriceOracles)
+import AMM.LPToken (T as LPToken)
+import qualified Models.Token as Token
+
+-- | Extends the AMM.Pool.T template with the choice to remove liquidity.
+template instance T where
+  -- | Allows a liquidity provider to burn their LP tokens in exchange for a
+  -- | proportional share of the underlying token reserves. This choice is
+  -- | controlled by the liquidity provider, who must be an observer on the pool.
+  choice RemoveLiquidity : (ContractId T, Decimal, Decimal)
+    -- | Result is the new Pool contract ID, amount of token A returned,
+    -- | and amount of token B returned.
+    with
+      provider: Party
+      -- ^ The liquidity provider removing liquidity. Must be the controller.
+      lpTokenCids: [ContractId LPToken]
+      -- ^ A list of `LPToken` contracts to be burned.
+      minAmountAReturned: Decimal
+      -- ^ Slippage protection: the minimum amount of token A the provider must receive.
+      minAmountBReturned: Decimal
+      -- ^ Slippage protection: the minimum amount of token B the provider must receive.
+      recipient: Party
+      -- ^ The party who will receive the returned tokens.
+    controller provider
+    do
+      -- === 1. Authorization and Data Fetching ===
+      assertMsg "Controller must be a registered liquidity provider for this pool"
+        (Set.member provider self.lpProviders)
+      assertMsg "Must provide at least one LP token to burn" (not $ null lpTokenCids)
+
+      lpTokens <- mapA fetch lpTokenCids
+
+      -- Ensure all provided LP tokens are owned by the controller (the provider).
+      forA_ lpTokens \lpToken ->
+        assertMsg "LP Token owner must be the provider exercising this choice"
+          (lpToken.owner == provider)
+
+      let liquidityToBurn = sum $ map (.quantity) lpTokens
+      assertMsg "Liquidity to burn must be positive" (liquidityToBurn > 0.0)
+      assertMsg "Cannot burn more liquidity than exists in the pool" (liquidityToBurn <= self.totalLPSupply)
+
+      -- === 2. Update Price Oracle ===
+      -- This ensures the time-weighted average price is accurate up to this transaction.
+      currentTime <- time
+      let (updatedPriceCumulativeA, updatedPriceCumulativeB) =
+            updatePriceOracles self currentTime
+
+      -- === 3. Calculate Proportional Amounts to Return ===
+      -- amountOut = (reserve * liquidity_burned) / total_lp_supply
+      let amountAReturned = (self.reserveA * liquidityToBurn) / self.totalLPSupply
+      let amountBReturned = (self.reserveB * liquidityToBurn) / self.totalLPSupply
+
+      -- === 4. Slippage Checks ===
+      assertMsg ("Slippage protection failed for Token A. Required >= " <> show minAmountAReturned <> ", but calculated " <> show amountAReturned)
+        (amountAReturned >= minAmountAReturned)
+      assertMsg ("Slippage protection failed for Token B. Required >= " <> show minAmountBReturned <> ", but calculated " <> show amountBReturned)
+        (amountBReturned >= minAmountBReturned)
+
+      -- === 5. Burn LP Tokens ===
+      archive lpTokenCids
+
+      -- === 6. Transfer Assets from Pool to Recipient ===
+      (remainingTokenACid, returnedTokenACid) <- exercise self.tokenAReserveCid (Token.Split amountAReturned)
+      exercise returnedTokenACid (Token.Transfer recipient)
+
+      (remainingTokenBCid, returnedTokenBCid) <- exercise self.tokenBReserveCid (Token.Split amountBReturned)
+      exercise returnedTokenBCid (Token.Transfer recipient)
+
+      -- === 7. Create the New, Updated Pool State ===
+      let
+        newPool = self with
+          reserveA = self.reserveA - amountAReturned
+          reserveB = self.reserveB - amountBReturned
+          tokenAReserveCid = remainingTokenACid
+          tokenBReserveCid = remainingTokenBCid
+          totalLPSupply = self.totalLPSupply - liquidityToBurn
+          lastPriceCumulativeA = updatedPriceCumulativeA
+          lastPriceCumulativeB = updatedPriceCumulativeB
+          blockTimestampLast = currentTime
+          -- Note: lpProviders set is not modified here. A provider can have zero liquidity
+          -- but still be considered a member of the pool for potential future deposits.
+
+      -- === 8. Atomically Archive Old Pool and Create New One ===
+      newPoolCid <- create newPool
+      archive self.cid
+
+      return (newPoolCid, amountAReturned, amountBReturned)
