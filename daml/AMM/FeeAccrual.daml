@@ -1,0 +1,91 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module AMM.FeeAccrual where
+
+-- | This module implements the fee accrual logic for the AMM, following the
+-- | Uniswap v2 model. In this model, a fixed percentage fee is taken
+-- | from the input amount of every swap. This fee is not sent to a separate
+-- | treasury but is instead added to the pool's reserves.
+-- |
+-- | By increasing the reserves, the value of the pool's liquidity (represented
+-- | by LP tokens) grows over time. Liquidity providers realize their share of
+-- | the accrued fees when they redeem their LP tokens by removing liquidity.
+-- | This mechanism ensures that fees are continuously and passively compounded
+-- | for the benefit of LPs.
+-- |
+-- | The functions in this module are pure calculations used by the `AMM.Swap`
+-- | module to determine trade amounts, incorporating the fee logic.
+
+-- | The fee is denominated in basis points (bps). 1 basis point = 0.01%.
+-- | Uniswap V2's standard fee is 0.30%, which is 30 basis points.
+feeBps : Int
+feeBps = 30
+
+-- | The denominator for basis points calculation (100% = 10,000 bps).
+bpsDenominator : Int
+bpsDenominator = 10000
+
+-- | Calculates the input amount remaining after the swap fee is deducted.
+-- | This is the value used in the constant product formula.
+-- | e.g., for a 100 token input and a 0.3% fee, this returns 99.7.
+calculateAmountInAfterFee : Decimal -> Decimal
+calculateAmountInAfterFee amountIn =
+  let
+    feeRateNumerator = intToDecimal (bpsDenominator - feeBps)
+    denominator = intToDecimal bpsDenominator
+  in
+    amountIn * feeRateNumerator / denominator
+
+-- | Calculates the amount of output tokens a user will receive for a given
+-- | input amount of tokens, considering the swap fee. This is used for swaps
+-- | where the input amount is exact.
+-- |
+-- | Formula (post-fee):
+-- |   amountOut = (reserveOut * amountInAfterFee) / (reserveIn + amountInAfterFee)
+getAmountOut
+  : Decimal -- ^ amountIn: The amount of input tokens being swapped.
+  -> Decimal -- ^ reserveIn: The pool's reserve of the input token.
+  -> Decimal -- ^ reserveOut: The pool's reserve of the output token.
+  -> Decimal -- ^ The calculated amount of output tokens.
+getAmountOut amountIn reserveIn reserveOut =
+  assertMsg "AMM: INPUT_AMOUNT_ZERO" (amountIn > 0.0)
+  assertMsg "AMM: INSUFFICIENT_LIQUIDITY" (reserveIn > 0.0 && reserveOut > 0.0)
+  let
+    amountInAfterFee = calculateAmountInAfterFee amountIn
+    numerator = amountInAfterFee * reserveOut
+    denominator = reserveIn + amountInAfterFee
+  in
+    numerator / denominator
+
+-- | Calculates the required amount of input tokens to receive a specific
+-- | amount of output tokens, considering the swap fee. This is used for swaps
+-- | where the output amount is exact.
+-- |
+-- | Formula (rearranged and including fee):
+-- |   amountIn = ((reserveIn * amountOut) / (reserveOut - amountOut)) / (1 - feeRate)
+getAmountIn
+  : Decimal -- ^ amountOut: The desired amount of output tokens.
+  -> Decimal -- ^ reserveIn: The pool's reserve of the input token.
+  -> Decimal -- ^ reserveOut: The pool's reserve of the output token.
+  -> Decimal -- ^ The required amount of input tokens.
+getAmountIn amountOut reserveIn reserveOut =
+  assertMsg "AMM: OUTPUT_AMOUNT_ZERO" (amountOut > 0.0)
+  assertMsg "AMM: INSUFFICIENT_LIQUIDITY" (reserveIn > 0.0 && reserveOut > 0.0)
+  assertMsg "AMM: INSUFFICIENT_LIQUIDITY_FOR_OUTPUT" (amountOut < reserveOut)
+
+  let
+    -- Numerator of the (1 - feeRate) reciprocal: bpsDenominator
+    feeReciprocalNumerator = intToDecimal bpsDenominator
+    -- Denominator of the (1 - feeRate) reciprocal: bpsDenominator - feeBps
+    feeReciprocalDenominator = intToDecimal (bpsDenominator - feeBps)
+
+    -- Base required input before considering fees
+    -- requiredAmountAfterFee = (reserveIn * amountOut) / (reserveOut - amountOut)
+    numerator = reserveIn * amountOut * feeReciprocalNumerator
+    denominator = (reserveOut - amountOut) * feeReciprocalDenominator
+  in
+    -- Add a tiny constant (1 unit in the 10th decimal place) to prevent rounding
+    -- issues where the calculated input is slightly too low to produce the desired output.
+    -- This is a common practice in fixed-point arithmetic AMM implementations.
+    (numerator / denominator) + 0.0000000001
