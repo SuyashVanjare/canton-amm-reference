@@ -1,0 +1,119 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module AMM.AddLiquidity where
+
+import DA.Assert
+import DA.Math
+import DA.Optional (fromSome)
+
+import qualified DAVL.V1.Asset as Asset
+import qualified DAVL.V1.Interfaces.Fungible as Fungible
+
+import AMM.Pool (Pool(..))
+import AMM.LPToken (LPTokenManager(..))
+
+-- | Result of adding liquidity to a pool.
+data AddLiquidityResult = AddLiquidityResult
+  with
+    newPoolCid : ContractId Pool
+      -- ^ The `ContractId` of the updated pool.
+    amountA : Decimal
+      -- ^ The actual amount of token A deposited.
+    amountB : Decimal
+      -- ^ The actual amount of token B deposited.
+    liquidityMinted : Decimal
+      -- ^ The amount of LP tokens minted for the provider.
+  deriving (Eq, Show)
+
+-- | Helper function to calculate the required amount of one token given an
+-- | amount of the other, preserving the reserve ratio.
+quote : Decimal -> Decimal -> Decimal -> Decimal
+quote amountA reserveA reserveB =
+  assertMsg "Reserve A must be positive for quote" (reserveA > 0.0)
+  (amountA * reserveB) / reserveA
+
+template instance Pool with
+  -- | Allows a liquidity provider to deposit tokens into the pool and receive
+  -- | LP (liquidity provider) tokens in return. The amount of tokens deposited
+  -- | must be proportional to the current reserves.
+  nonconsuming choice AddLiquidity : AddLiquidityResult
+    with
+      provider : Party
+        -- ^ The party providing the liquidity.
+      amountADesired : Decimal
+        -- ^ The desired amount of token A to add.
+      amountBDesired : Decimal
+        -- ^ The desired amount of token B to add.
+      amountAMin : Decimal
+        -- ^ The minimum amount of token A to add (for slippage protection).
+      amountBMin : Decimal
+        -- ^ The minimum amount of token B to add (for slippage protection).
+      tokenAHoldingCid : ContractId Fungible.I
+        -- ^ The provider's holding of token A.
+      tokenBHoldingCid : ContractId Fungible.I
+        -- ^ The provider's holding of token B.
+    controller provider
+    do
+      -- Pre-condition checks on desired and minimum amounts.
+      assertMsg "Desired amount of token A must be positive" (amountADesired > 0.0)
+      assertMsg "Desired amount of token B must be positive" (amountBDesired > 0.0)
+      assertMsg "Minimum amount of token A must be non-negative" (amountAMin >= 0.0)
+      assertMsg "Minimum amount of token B must be non-negative" (amountBMin >= 0.0)
+
+      -- Fetch contracts needed for the operation.
+      tokenAHolding <- fetch tokenAHoldingCid
+      tokenBHolding <- fetch tokenBHoldingCid
+      lpTokenManager <- fetch lpTokenManagerCid
+
+      -- Verify that the holdings are valid for this operation.
+      let
+        tokenAHoldingView = fromSome (coerceInterface tokenAHoldingCid : Optional Fungible.View)
+        tokenBHoldingView = fromSome (coerceInterface tokenBHoldingCid : Optional Fungible.View)
+      assertMsg "Provider must be the owner of the token A holding" (tokenAHoldingView.owner == provider)
+      assertMsg "Provider must be the owner of the token B holding" (tokenBHoldingView.owner == provider)
+      assertMsg "Token A holding must be of the correct asset type" (tokenAHoldingView.asset.id == self.tokenA)
+      assertMsg "Token B holding must be of the correct asset type" (tokenBHoldingView.asset.id == self.tokenB)
+
+      -- Determine the actual amounts to deposit and the amount of liquidity tokens to mint.
+      (amountA, amountB, liquidity) <- if reserveA == 0.0 && reserveB == 0.0 then do
+        -- This is the first liquidity provision.
+        -- The amount of liquidity minted is sqrt(x * y).
+        let liquidityMinted = sqrt (amountADesired * amountBDesired)
+        assertMsg "Initial liquidity minted must be positive" (liquidityMinted > 0.0)
+        return (amountADesired, amountBDesired, liquidityMinted)
+      else do
+        -- Pool already has liquidity. Calculate optimal deposit amounts to maintain the reserve ratio.
+        let amountBOptimal = quote amountADesired reserveA reserveB
+        (actualAmountA, actualAmountB) <- if amountBOptimal <= amountBDesired then do
+            -- `amountADesired` is the limiting factor.
+            assertMsg "Slippage check failed for token B" (amountBOptimal >= amountBMin)
+            return (amountADesired, amountBOptimal)
+          else do
+            -- `amountBDesired` is the limiting factor.
+            let amountAOptimal = quote amountBDesired reserveB reserveA
+            assertMsg "Slippage check failed for token A" (amountAOptimal >= amountAMin)
+            return (amountAOptimal, amountBDesired)
+
+        -- Calculate LP tokens to mint proportionally to the existing total supply.
+        let liquidityMinted = min ((actualAmountA * lpTokenManager.totalSupply) / reserveA) ((actualAmountB * lpTokenManager.totalSupply) / reserveB)
+        return (actualAmountA, actualAmountB, liquidityMinted)
+
+      -- Final slippage check on the calculated deposit amounts.
+      assertMsg "Final slippage check failed: amountA is below minimum" (amountA >= amountAMin)
+      assertMsg "Final slippage check failed: amountB is below minimum" (amountB >= amountBMin)
+
+      -- 1. Transfer tokens from the provider to the pool.
+      exercise tokenAHoldingCid Fungible.Transfer with newOwner = poolParty; amount = amountA
+      exercise tokenBHoldingCid Fungible.Transfer with newOwner = poolParty; amount = amountB
+
+      -- 2. Mint new LP tokens for the provider. This archives the old manager and returns the new one.
+      (newLPTokenManagerCid, _lpTokenHoldingCid) <- exercise lpTokenManagerCid Mint with receiver = provider; quantity = liquidity
+
+      -- 3. Atomically update the pool state with new reserves and the new LP token manager CID.
+      newPoolCid <- create this with
+        reserveA = self.reserveA + amountA
+        reserveB = self.reserveB + amountB
+        lpTokenManagerCid = newLPTokenManagerCid
+
+      return AddLiquidityResult with newPoolCid, amountA, amountB, liquidityMinted = liquidity
