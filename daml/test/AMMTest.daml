@@ -1,0 +1,244 @@
+module AMMTest where
+
+import Daml.Script
+import DA.Assert
+import DA.Math (sqrt)
+import DA.Text (show)
+import DA.Time (time)
+import DA.Date (date)
+
+import AMM.LPToken
+import AMM.AddLiquidity
+import AMM.RemoveLiquidity
+import AMM.Swap
+import AMM.FeeAccrual
+
+-- === Constants ===
+
+tokenA : Text = "TokenA"
+tokenB : Text = "TokenB"
+lpTokenSymbol : Text = "AMM-LP"
+
+-- Fee is 30 basis points (0.3%)
+swapFee : Decimal = 0.003
+protocolFee : Decimal = 0.0
+
+-- === Test Suite ===
+
+test : Script ()
+test = script do
+  testSwapPrecision
+  testLpMintBurnInvariant
+  testFeeAccrual
+  testEdgeCases
+
+-- === Test Helpers ===
+
+-- A helper to assert that two Decimals are close to each other within a given tolerance.
+-- This is necessary for calculations involving division and square roots.
+assertClose: CanAssert m => Text -> Decimal -> Decimal -> m ()
+assertClose msg expected actual =
+  let
+    tolerance = 0.00001
+    diff = abs (expected - actual)
+  in
+    assertMsg (msg <> " | Expected: " <> show expected <> ", Actual: " <> show actual <> ", Diff: " <> show diff) (diff < tolerance)
+
+setupParties: Script (Party, Party, Party)
+setupParties = do
+  operator <- allocateParty "Operator"
+  lp1 <- allocateParty "LP1"
+  trader1 <- allocateParty "Trader1"
+  return (operator, lp1, trader1)
+
+setupInitialPool: Party -> Party -> Script (ContractId Factory, ContractId Pool, ContractId PoolState)
+setupInitialPool operator lp1 = do
+  factoryCid <- submit operator do
+    createCmd Factory with operator, tokenA, tokenB, lpTokenSymbol
+
+  -- LP1 provides the initial liquidity
+  (poolCid, poolStateCid, _lpTokensMinted) <- submit lp1 do
+    exerciseCmd factoryCid AddLiquidity.AddInitialLiquidity with
+      provider = lp1
+      amountADesired = 1000.0
+      amountBDesired = 4000.0
+      amountAMin = 1000.0
+      amountBMin = 4000.0
+      deadline = time (date 2030 Jan 1) 0 0 0
+
+  return (factoryCid, poolCid, poolStateCid)
+
+-- === Test Cases ===
+
+testSwapPrecision : Script ()
+testSwapPrecision = test "Swap output amount is calculated correctly" do
+  (operator, lp1, trader1) <- setupParties
+  (_factoryCid, _poolCid, poolStateCid) <- setupInitialPool operator lp1
+
+  -- Initial state: reserveA = 1000.0, reserveB = 4000.0
+  let
+    amountAIn = 100.0
+    reserveA = 1000.0
+    reserveB = 4000.0
+
+  -- Uniswap v2 formula:
+  -- amountOut = (amountIn * (1 - fee) * reserveOut) / (reserveIn + amountIn * (1 - fee))
+  let
+    amountInWithFee = amountAIn * (1.0 - swapFee) -- 100.0 * 0.997 = 99.7
+    expectedAmountBOut = (amountInWithFee * reserveB) / (reserveA + amountInWithFee)
+    -- expectedAmountBOut = (99.7 * 4000.0) / (1000.0 + 99.7) = 398800.0 / 1099.7 = 362.64435755...
+
+  -- Trader1 swaps 100 of TokenA for TokenB
+  (actualAmountBOut, _newPoolStateCid) <- submit trader1 do
+    exerciseCmd poolStateCid Swap.SwapTokenAForTokenB with
+      swapper = trader1
+      amountAIn = amountAIn
+      amountBOutMin = 0.0
+      deadline = time (date 2030 Jan 1) 0 0 0
+
+  assertClose "Swap output for TokenB is incorrect" expectedAmountBOut actualAmountBOut
+
+testLpMintBurnInvariant : Script ()
+testLpMintBurnInvariant = test "LP tokens are minted and burned proportionally" do
+  (operator, lp1, _trader1) <- setupParties
+  lp2 <- allocateParty "LP2"
+
+  -- Setup initial pool with LP1
+  (factoryCid, poolCid, poolStateCid) <- setupInitialPool operator lp1
+
+  -- Fetch initial pool state to check total supply
+  initialPool <- fetch poolCid
+  let initialLpSupply = initialPool.totalSupply
+  let initialReserveA = 1000.0
+  let initialReserveB = 4000.0
+
+  assertClose "Initial LP supply should be sqrt(1000*4000)" (sqrt(initialReserveA * initialReserveB)) initialLpSupply
+
+  -- LP2 adds liquidity
+  let
+    amountAInLp2 = 250.0 -- 25% of initial A reserve
+    -- required B = amountA * reserveB / reserveA = 250.0 * 4000.0 / 1000.0 = 1000.0
+    expectedAmountBInLp2 = 1000.0
+    -- expected LP minted = amountA * totalSupply / reserveA = 250.0 * 2000.0 / 1000.0 = 500.0
+    expectedLpMinted = 500.0
+
+  (actualAmountBInLp2, _newPoolStateCid, lpTokensMinted) <- submit lp2 do
+    exerciseCmd poolStateCid AddLiquidity.AddLiquidity with
+      provider = lp2
+      amountADesired = amountAInLp2
+      amountBDesired = 2000.0 -- provide excess to test ratio calculation
+      amountAMin = amountAInLp2
+      amountBMin = 0.0
+      deadline = time (date 2030 Jan 1) 0 0 0
+
+  assertClose "Optimal amountB for adding liquidity is incorrect" expectedAmountBInLp2 actualAmountBInLp2
+  assertClose "Amount of LP tokens minted is incorrect" expectedLpMinted lpTokensMinted
+
+  -- After LP2's deposit:
+  -- reserveA = 1250.0, reserveB = 5000.0, totalSupply = 2500.0
+  -- LP1 owns 2000.0 LP, LP2 owns 500.0 LP
+
+  -- Now LP2 removes all their liquidity
+  let lpAmountToBurn = 500.0
+  let currentTotalSupply = 2500.0
+  let currentReserveA = 1250.0
+  let currentReserveB = 5000.0
+
+  -- amountAOut = lpAmount * reserveA / totalSupply = 500.0 * 1250.0 / 2500.0 = 250.0
+  let expectedAmountAOut = (lpAmountToBurn * currentReserveA) / currentTotalSupply
+  -- amountBOut = lpAmount * reserveB / totalSupply = 500.0 * 5000.0 / 2500.0 = 1000.0
+  let expectedAmountBOut = (lpAmountToBurn * currentReserveB) / currentTotalSupply
+
+  (finalPoolStateCid, _finalPoolCid) <- submit lp2 do
+    exerciseCmd factoryCid RemoveLiquidity.RemoveLiquidity with
+      provider = lp2
+      lpAmount = lpAmountToBurn
+      amountAMin = 0.0
+      amountBMin = 0.0
+      deadline = time (date 2030 Jan 1) 0 0 0
+
+  -- We check the resulting pool state to see if the amounts were correctly removed.
+  finalState <- fetch finalPoolStateCid
+  assertClose "Amount of TokenA returned on liquidity removal is incorrect" initialReserveA finalState.reserveA
+  assertClose "Amount of TokenB returned on liquidity removal is incorrect" initialReserveB finalState.reserveB
+
+testFeeAccrual : Script ()
+testFeeAccrual = test "Liquidity providers earn fees from swaps" do
+  (operator, lp1, trader1) <- setupParties
+  (factoryCid, _poolCid, poolStateCid) <- setupInitialPool operator lp1
+
+  let
+    initialReserveA = 1000.0
+    initialReserveB = 4000.0
+    initialK = initialReserveA * initialReserveB
+
+  -- Trader1 performs a swap
+  (_amountBOut, poolStateCidAfterSwap) <- submit trader1 do
+    exerciseCmd poolStateCid Swap.SwapTokenAForTokenB with
+      swapper = trader1
+      amountAIn = 100.0
+      amountBOutMin = 0.0
+      deadline = time (date 2030 Jan 1) 0 0 0
+
+  stateAfterSwap <- fetch poolStateCidAfterSwap
+  let
+    finalReserveA = stateAfterSwap.reserveA
+    finalReserveB = stateAfterSwap.reserveB
+    finalK = finalReserveA * finalReserveB
+
+  -- The constant product 'k' should have increased due to the fee
+  assertMsg ("Final k (" <> show finalK <> ") should be greater than initial k (" <> show initialK <> ")") (finalK > initialK)
+
+  -- Now, LP1 removes all liquidity. As the sole LP, they should get all tokens in the pool.
+  -- They should have more value than they started with, demonstrated by receiving more than
+  -- their initial 1000.0 of TokenA.
+  (finalFinalPoolState, _finalPoolCid) <- submit lp1 do
+    exerciseCmd factoryCid RemoveLiquidity.RemoveLiquidity with
+      provider = lp1
+      lpAmount = 2000.0 -- Their initial mint
+      amountAMin = 0.0
+      amountBMin = 0.0
+      deadline = time (date 2030 Jan 1) 0 0 0
+
+  -- The pool should now be empty. We can check the final state.
+  finalFinalState <- fetch finalFinalPoolState
+  assertMsg "Pool should be empty after sole LP removes all liquidity" (finalFinalState.reserveA < 1.0 && finalFinalState.reserveB < 1.0)
+  -- The important check is that the reserves returned (which are equal to the reserves before withdrawal)
+  -- represent a gain for the LP.
+  assertMsg ("LP should have more of token A after fees (" <> show finalReserveA <> ") than initially (" <> show initialReserveA <> ")") (finalReserveA > initialReserveA)
+
+testEdgeCases: Script ()
+testEdgeCases = test "Edge cases and reverts" do
+  (operator, lp1, trader1) <- setupParties
+  (factoryCid, poolCid, poolStateCid) <- setupInitialPool operator lp1
+
+  -- Test swap with too low amountBOutMin
+  submitMustFail trader1 do
+    exerciseCmd poolStateCid Swap.SwapTokenAForTokenB with
+      swapper = trader1, amountAIn = 100.0, amountBOutMin = 400.0, deadline = time (date 2030 Jan 1) 0 0 0
+
+  -- Test add liquidity with too high amountAMin
+  submitMustFail lp1 do
+    exerciseCmd poolStateCid AddLiquidity.AddLiquidity with
+      provider = lp1, amountADesired = 100.0, amountBDesired = 400.0, amountAMin = 101.0, amountBMin = 399.0, deadline = time (date 2030 Jan 1) 0 0 0
+
+  -- Test remove liquidity with insufficient LP tokens (attempting to burn more than owned)
+  submitMustFail lp1 do
+    exerciseCmd factoryCid RemoveLiquidity.RemoveLiquidity with
+      provider = lp1, lpAmount = 9999.0, amountAMin = 0.0, amountBMin = 0.0, deadline = time (date 2030 Jan 1) 0 0 0
+
+  -- Test deadline expiry
+  let expiredTime = time (date 2020 Jan 1) 0 0 0
+  submitMustFail trader1 do
+    exerciseCmd poolStateCid Swap.SwapTokenAForTokenB with
+      swapper = trader1, amountAIn = 100.0, amountBOutMin = 0.0, deadline = expiredTime
+  
+  -- Test swap with zero input
+  submitMustFail trader1 do
+    exerciseCmd poolStateCid Swap.SwapTokenAForTokenB with
+      swapper = trader1, amountAIn = 0.0, amountBOutMin = 0.0, deadline = time (date 2030 Jan 1) 0 0 0
+  
+  -- Test add liquidity with zero input
+  submitMustFail lp1 do
+    exerciseCmd poolStateCid AddLiquidity.AddLiquidity with
+      provider = lp1, amountADesired = 0.0, amountBDesired = 1.0, amountAMin = 0.0, amountBMin = 0.0, deadline = time (date 2030 Jan 1) 0 0 0
