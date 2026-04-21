@@ -3,115 +3,128 @@
 
 module AMM.Swap where
 
-import DA.Assert
+import Daml.Finance.Interface.Asset.Fungible qualified as F (I, Merge(..), Split(..), Transfer(..))
+import Daml.Finance.Interface.Types.Common.Types (Account, InstrumentKey)
+import DA.Assert (assertMsg, abort)
+import DA.List (head, tail)
 
 import AMM.Pool (Pool(..))
-import AMM.Token (FungibleToken)
 
--- | Pure function for calculating swap output amount based on the constant product formula (x*y=k).
--- This function encapsulates the core pricing logic of the AMM.
-getAmountOut:
-  Decimal -> -- ^ amountIn: The amount of tokens being sent to the pool.
-  Decimal -> -- ^ reserveIn: The reserve of the input token in the pool.
-  Decimal -> -- ^ reserveOut: The reserve of the output token in the pool.
-  Decimal    -- ^ Returns the amount of output tokens the swapper will receive.
-getAmountOut amountIn reserveIn reserveOut =
-  -- Ensure reserves are positive to prevent division by zero and other pathological cases.
-  assertMsg "INSUFFICIENT_LIQUIDITY: Input reserve must be positive." (reserveIn > 0.0)
-  assertMsg "INSUFFICIENT_LIQUIDITY: Output reserve must be positive." (reserveOut > 0.0)
-
-  -- Uniswap v2 charges a 0.3% fee (30 basis points).
-  -- This fee is taken from the input amount and remains in the pool, effectively
-  -- rewarding liquidity providers by increasing the value of their shares.
-  let
-    feeNumerator = 997.0
-    feeDenominator = 1000.0
-
-    amountInWithFee = amountIn * feeNumerator
-    numerator = amountInWithFee * reserveOut
-    denominator = (reserveIn * feeDenominator) + amountInWithFee
-
-  in
-    -- The output amount is calculated to keep the product of reserves constant after
-    -- accounting for the fee-adjusted input. The formula is:
-    -- amountOut = (reserveOut * amountIn * 997) / (reserveIn * 1000 + amountIn * 997)
-    numerator / denominator
-
--- This template instance adds the `SwapExactTokensForTokens` choice to the `Pool`
--- template defined in `AMM.Pool`. This allows for modular separation of concerns,
--- keeping swap logic separate from core pool management and other functionalities
--- like adding/removing liquidity.
+-- | Implements the swap functionality for the AMM Pool, allowing for atomic
+-- | exchange of one token for another.
 template instance Pool with
-  -- This is a consuming choice that atomically swaps a user-provided amount of one token
-  -- for a calculated amount of the other token in the pool. It archives the existing
-  -- pool contract and creates a new one with updated reserves.
-  choice SwapExactTokensForTokens : (ContractId Pool, ContractId FungibleToken)
-    -- ^ Returns a tuple containing the ContractId of the updated Pool contract and the
-    --   newly created fungible token contract for the recipient.
+
+  -- | Allows a trader to swap an exact amount of an input token for a minimum
+  -- | amount of an output token. This is a multi-actor choice requiring authorization
+  -- | from both the trader (who provides the input assets) and the pool operator
+  -- | (who manages the pool's liquidity).
+  -- |
+  -- | The choice will fail if the calculated output amount is less than `minAmountOut`,
+  -- | protecting the trader from excessive slippage due to price movement between
+  -- | transaction submission and execution.
+  choice SwapExactTokensForTokens : ContractId Pool
     with
-      swapper : Party
-      -- ^ The party initiating the swap. They must be the owner of `tokenInCid`.
-      tokenInCid : ContractId FungibleToken
-      -- ^ The contract for the input tokens being provided by the swapper. This contract
-      --   will be archived as part of the transaction.
-      amountOutMin : Decimal
-      -- ^ The minimum amount of output tokens the swapper is willing to accept. This
-      --   provides protection against price slippage during transaction execution.
-      recipient : Party
-      -- ^ The party who will receive the swapped tokens.
-    controller swapper
+      trader: Party
+        -- ^ The party performing the swap. Must own the input tokens.
+      amountIn: Decimal
+        -- ^ The exact amount of tokens being swapped in.
+      minAmountOut: Decimal
+        -- ^ The minimum amount of tokens the trader is willing to accept.
+      traderTokenInCid: ContractId F.I
+        -- ^ The contract ID of the fungible token the trader is providing.
+      path: [InstrumentKey]
+        -- ^ The swap path. For a direct swap, this is `[tokenIn, tokenOut]`.
+      traderReceiverAccount: Account
+        -- ^ The account where the trader will receive the swapped tokens.
+    controller trader, operator
     do
-      -- 1. Fetch the input token contract to verify its details. The `swapper` being a
-      --    controller on this choice provides the authority to fetch their own token contract.
-      tokenIn <- fetch tokenInCid
-      assertEqual tokenIn.owner swapper "SWAPPER_MUST_OWN_INPUT_TOKENS"
+      -- Validate inputs
+      assertMsg "SWAP_PATH_INVALID: Path must contain exactly two instruments." $ length path == 2
+      let tokenInInstrument = head path
+      let tokenOutInstrument = head $ tail path
+      assertMsg "SWAP_IDENTICAL_ASSETS: Cannot swap an asset for itself." $
+        tokenInInstrument.id /= tokenOutInstrument.id
 
-      let
-        amountIn = tokenIn.quantity
-        tokenInInstrument = tokenIn.instrument
+      assertMsg "SWAP_POSITIVE_INPUT_REQUIRED: Input amount must be greater than zero." $ amountIn > 0.0
+      assertMsg "SWAP_POSITIVE_MIN_OUTPUT_REQUIRED: Minimum output must be greater than zero." $
+        minAmountOut > 0.0
 
-      -- 2. Determine the swap direction and get the corresponding reserves from the pool state.
-      (reserveIn, reserveOut, tokenOutInstrument) <-
-        if tokenInInstrument == this.instrumentA then
-          return (this.reserveA, this.reserveB, this.instrumentB)
-        else if tokenInInstrument == this.instrumentB then
-          return (this.reserveB, this.reserveA, this.instrumentA)
-        else
-          abort ("INVALID_TOKEN: Input token " <> show tokenInInstrument <> " is not one of the two tokens in this pool.")
+      -- Verify trader's input token contract
+      traderTokenIn <- fetch traderTokenInCid
+      assertMsg "SWAP_INVALID_INPUT_INSTRUMENT: Provided token does not match the first instrument in the path." $
+        traderTokenIn.id == tokenInInstrument
+      assertMsg "SWAP_INPUT_AMOUNT_MISMATCH: Provided token amount does not match the specified input amount." $
+        traderTokenIn.amount == amountIn
+      assertMsg "SWAP_INVALID_OWNER: Trader must be the owner of the input token." $
+        traderTokenIn.account.owner == trader
+      assertMsg "SWAP_INVALID_RECEIVER: Trader must own the receiving account." $
+        traderReceiverAccount.owner == trader
 
-      -- 3. Calculate the amount of output tokens using the pure `getAmountOut` function.
-      let amountOut = getAmountOut amountIn reserveIn reserveOut
+      -- Determine which pool reserve corresponds to the input/output tokens
+      let ( (reserveIn, reserveOut)
+          , (poolTokenInCid, poolTokenOutCid)
+          ) = if tokenInInstrument.id == self.tokenA.id then
+                do
+                  assertMsg "SWAP_INVALID_OUTPUT_INSTRUMENT: Second path instrument does not match pool's token B."
+                    (tokenOutInstrument.id == self.tokenB.id)
+                  ( (self.reserveA, self.reserveB)
+                  , (self.poolTokenACid, self.poolTokenBCid)
+                  )
+              else if tokenInInstrument.id == self.tokenB.id then
+                do
+                  assertMsg "SWAP_INVALID_OUTPUT_INSTRUMENT: Second path instrument does not match pool's token A."
+                    (tokenOutInstrument.id == self.tokenA.id)
+                  ( (self.reserveB, self.reserveA)
+                  , (self.poolTokenBCid, self.poolTokenACid)
+                  )
+              else
+                abort "SWAP_INPUT_TOKEN_NOT_IN_POOL: The first instrument in the path is not traded in this pool."
 
-      -- 4. Enforce the user-defined slippage protection. The transaction will fail if the
-      --    calculated output is less than the specified minimum.
-      assertMsg ("INSUFFICIENT_OUTPUT_AMOUNT: Slippage tolerance not met. " <>
-                 "Required at least " <> show amountOutMin <> ", but calculated " <> show amountOut <> ".")
-                 (amountOut >= amountOutMin)
+      assertMsg "SWAP_INSUFFICIENT_LIQUIDITY: Pool reserves are empty." $ reserveIn > 0.0 && reserveOut > 0.0
 
-      -- 5. Atomically execute the state changes.
-      -- 5a. Consume the swapper's input tokens by archiving their contract.
-      archive tokenInCid
+      -- Calculate output amount based on the constant product formula (x * y = k), including fees.
+      -- Uniswap V2 formula: amountOut = (amountIn * feeFactor * reserveOut) / (reserveIn + amountIn * feeFactor)
+      let feeFactor = 1.0 - self.fee
+      let amountInWithFee = amountIn * feeFactor
+      let numerator = amountInWithFee * reserveOut
+      let denominator = reserveIn + amountInWithFee
+      let amountOut = numerator / denominator
 
-      -- 5b. Calculate the new reserves for the pool.
-      let
-        (newReserveA, newReserveB) =
-          if tokenInInstrument == this.instrumentA
-          then (this.reserveA + amountIn, this.reserveB - amountOut)
-          else (this.reserveA - amountOut, this.reserveB + amountIn)
+      -- The core slippage check: ensure the trader receives at least the minimum expected amount.
+      assertMsg "SWAP_SLIPPAGE_TOO_HIGH: Calculated output is less than the minimum required." $
+        amountOut >= minAmountOut
+      assertMsg "SWAP_INSUFFICIENT_OUTPUT_LIQUIDITY: Not enough liquidity for the output token." $
+        amountOut < reserveOut
 
-      -- 5c. Create the new, updated pool contract, archiving the old one implicitly.
-      --     The new pool inherits all properties of the old one, with updated reserves.
-      newPoolCid <- create this with
+      -- The following ledger updates are performed atomically as a single transaction.
+
+      -- 1. Merge trader's input tokens into the pool's holdings.
+      newPoolTokenInCid <- exercise poolTokenInCid F.Merge with
+        cidsToMerge = [traderTokenInCid]
+
+      -- 2. Split the required output tokens from the pool's holdings.
+      splitResult <- exercise poolTokenOutCid F.Split with
+        amounts = [amountOut]
+
+      let traderPayoutCid = head splitResult.newCids
+      let newPoolTokenOutCid = splitResult.remainingCid
+
+      -- 3. Transfer the newly split tokens to the trader's receiver account.
+      _ <- exercise traderPayoutCid F.Transfer with
+        newOwnerAccount = traderReceiverAccount
+
+      -- 4. Update pool state and recreate the contract with new reserves and token holdings.
+      let newReserveIn = reserveIn + amountIn
+      let newReserveOut = reserveOut - amountOut
+
+      let (newReserveA, newReserveB, newPoolTokenACid, newPoolTokenBCid) =
+            if tokenInInstrument.id == self.tokenA.id then
+              (newReserveIn, newReserveOut, newPoolTokenInCid, newPoolTokenOutCid)
+            else
+              (newReserveOut, newReserveIn, newPoolTokenOutCid, newPoolTokenInCid)
+
+      create this with
         reserveA = newReserveA
         reserveB = newReserveB
-
-      -- 5d. Create the output tokens and assign them to the recipient. The authority to create
-      --     these tokens comes from the `manager` of the pool, who is a signatory on this
-      --     template and is assumed to be the issuer of the tokens.
-      outputTokenCid <- create FungibleToken with
-        instrument = tokenOutInstrument
-        quantity = amountOut
-        owner = recipient
-
-      -- 6. Return the contract IDs of the new pool and the new output tokens.
-      return (newPoolCid, outputTokenCid)
+        poolTokenACid = newPoolTokenACid
+        poolTokenBCid = newPoolTokenBCid
